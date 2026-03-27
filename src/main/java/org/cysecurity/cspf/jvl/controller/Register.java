@@ -77,7 +77,13 @@ public class Register extends HttpServlet {
           }
         catch(Exception e)
         {
-            
+            // Log the exception or provide a meaningful message
+            System.err.println("An error occurred during registration: " + e.getMessage());
+            try {
+                response.sendRedirect("Register.jsp?err=An error occurred during registration");
+            } catch (IOException ioEx) {
+                System.err.println("Failed to redirect after catching exception: " + ioEx.getMessage());
+            }
         }
     }
 

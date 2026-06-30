@@ -5,6 +5,7 @@
 /Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/LoginValidator.java
 /Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/Logout.java
 /Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/Open.java
+/Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/PaymentServicesClient.java
 /Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/Register.java
 /Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/SendMessage.java
 /Users/jacobr/Demo Repos/JavaVulnerableLab/src/main/java/org/cysecurity/cspf/jvl/controller/UsernameCheck.java

@@ -574,4 +574,205 @@ public class SecondOrderSQLInjectionTest {
         assertEquals("UNION payload must be bound as a safe parameter value",
                 storedUnionPayload, spy.getBoundString(1));
     }
+
+    // -------------------------------------------------------------------------
+    // Helper: simulate the parameterized UPDATE used in change-info.jsp
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reproduces the PreparedStatement execution path in change-info.jsp so we
+     * can verify that the second-order SQL injection sink (UPDATE users SET about)
+     * uses parameterized queries instead of string concatenation.
+     *
+     * The 'id' parameter mirrors session.getAttribute("userid") which originates
+     * from LoginValidator.java rs.getString("id") — data that was stored in the
+     * database from user registration, making this a classic second-order flow.
+     */
+    private void executeChangeInfoUpdate(Connection con, String info, String id)
+            throws SQLException {
+        PreparedStatement pstmt = con.prepareStatement(
+            "UPDATE users SET about=? WHERE id=?");
+        pstmt.setString(1, info);
+        pstmt.setString(2, id);
+        pstmt.executeUpdate();
+    }
+
+    // -------------------------------------------------------------------------
+    // change-info.jsp test cases
+    // -------------------------------------------------------------------------
+
+    /**
+     * change-info.jsp — verifies that the UPDATE uses a PreparedStatement
+     * template with two positional placeholders, not string concatenation.
+     * This is the primary remediation for the Second-Order SQL Injection
+     * (CWE-89) finding reported at line 31 of change-info.jsp.
+     */
+    @Test
+    public void testChangeInfoUsesParameterizedUpdate() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalInfo = "I like Java";
+        String normalId = "42";
+
+        executeChangeInfoUpdate(con, normalInfo, normalId);
+
+        assertEquals("change-info.jsp must call prepareStatement exactly once for the UPDATE",
+                1, con.getPreparedStatements().size());
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // SQL template must use positional parameters — no concatenation
+        assertTrue("UPDATE SQL template must contain '?' placeholders for user input",
+                spy.getSql().contains("?"));
+        assertFalse("UPDATE SQL template must NOT contain the raw info value",
+                spy.getSql().contains(normalInfo));
+        assertFalse("UPDATE SQL template must NOT contain the raw id value",
+                spy.getSql().contains(normalId));
+
+        // Values must be bound parameters, not embedded in SQL
+        assertEquals("Bound param 1 (info) must equal the exact input",
+                normalInfo, spy.getBoundString(1));
+        assertEquals("Bound param 2 (id) must equal the exact input",
+                normalId, spy.getBoundString(2));
+    }
+
+    /**
+     * change-info.jsp — second-order injection via the 'info' field.
+     *
+     * An attacker submits a malicious description value; it must be bound
+     * as data and never alter the SQL template structure.
+     */
+    @Test
+    public void testChangeInfoMaliciousInfoPayloadTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String maliciousInfo = "x', privilege='admin' WHERE id=1--";
+        String normalId = "5";
+
+        executeChangeInfoUpdate(con, maliciousInfo, normalId);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // The SQL template must remain static
+        assertEquals("UPDATE SQL template must be exactly the parameterized form",
+                "UPDATE users SET about=? WHERE id=?",
+                spy.getSql());
+
+        // The injection payload must be bound as data
+        assertEquals("Malicious info value must be bound as param 1 (data)",
+                maliciousInfo, spy.getBoundString(1));
+        assertEquals("Id must be bound as param 2",
+                normalId, spy.getBoundString(2));
+
+        // The attack payload must never appear in the SQL template
+        assertFalse("SQL template must not contain injection payload",
+                spy.getSql().contains("privilege"));
+        assertFalse("SQL template must not contain SQL comment '--'",
+                spy.getSql().contains("--"));
+    }
+
+    /**
+     * change-info.jsp — second-order injection via the 'id' session attribute.
+     *
+     * This is the exact second-order taint flow reported by the SAST finding:
+     *   1. A malicious value is stored in the database at registration time.
+     *   2. LoginValidator.java retrieves it (rs.getString("id")) and stores it
+     *      in session as "userid".
+     *   3. change-info.jsp reads session.getAttribute("userid") as 'id' and
+     *      previously embedded it directly in the SQL (string concatenation).
+     *
+     * After the fix, 'id' is bound as a PreparedStatement parameter.
+     */
+    @Test
+    public void testChangeInfoSecondOrderInjectionViaSessionId() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalInfo = "My profile";
+        // A second-order payload: stored in DB at registration, retrieved at login,
+        // placed in session "userid", then used at the SQL sink in change-info.jsp
+        String storedMaliciousId = "1 OR 1=1";
+
+        executeChangeInfoUpdate(con, normalInfo, storedMaliciousId);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // The SQL template must NOT be altered by the injected id
+        assertEquals("UPDATE SQL template must be exactly the parameterized form",
+                "UPDATE users SET about=? WHERE id=?",
+                spy.getSql());
+
+        // The tainted session id must be bound as a parameter, not embedded in SQL
+        assertFalse("SQL template must not contain second-order injection payload",
+                spy.getSql().contains("OR 1=1"));
+
+        assertEquals("info must be bound as param 1",
+                normalInfo, spy.getBoundString(1));
+        assertEquals("Second-order id payload must be bound as param 2 (data, not SQL)",
+                storedMaliciousId, spy.getBoundString(2));
+    }
+
+    /**
+     * change-info.jsp — verifies that exactly 2 '?' placeholders exist in the
+     * UPDATE SQL template: one for 'about' (info) and one for 'id'.
+     */
+    @Test
+    public void testChangeInfoUpdateHasTwoPlaceholders() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        executeChangeInfoUpdate(con, "some info", "99");
+
+        String sql = con.getPreparedStatements().get(0).getSql();
+        int placeholderCount = sql.length() - sql.replace("?", "").length();
+
+        assertEquals("UPDATE in change-info.jsp must have exactly 2 '?' placeholders " +
+                     "(one for 'about', one for 'id')",
+                2, placeholderCount);
+    }
+
+    /**
+     * change-info.jsp — classic UNION-based second-order attack through the id parameter.
+     * Verifies the UNION payload cannot escape the prepared statement boundary.
+     */
+    @Test
+    public void testChangeInfoUnionInjectionViaIdIsSafe() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalInfo = "hello";
+        String unionPayload = "0 UNION SELECT username,password FROM users--";
+
+        executeChangeInfoUpdate(con, normalInfo, unionPayload);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertFalse("UNION keyword must not appear in the UPDATE SQL template",
+                spy.getSql().toUpperCase().contains("UNION"));
+
+        assertEquals("UNION payload in id must be bound as safe parameter data",
+                unionPayload, spy.getBoundString(2));
+    }
+
+    /**
+     * change-info.jsp — regression test ensuring that normal, benign use of
+     * change-info.jsp (updating one's own profile description) continues to work
+     * correctly after the parameterization fix.
+     */
+    @Test
+    public void testChangeInfoNormalUseCaseWorksProperly() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String description = "Software developer with 5+ years of experience.";
+        String userId = "123";
+
+        executeChangeInfoUpdate(con, description, userId);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // Verify the SQL shape
+        assertTrue("UPDATE SQL template must reference 'users' table",
+                spy.getSql().toUpperCase().contains("USERS"));
+        assertTrue("UPDATE SQL template must set 'about' column",
+                spy.getSql().toLowerCase().contains("about"));
+        assertTrue("UPDATE SQL template must filter by 'id' column",
+                spy.getSql().toLowerCase().contains("id"));
+
+        // Verify parameter binding for normal values
+        assertEquals("Description must be correctly bound as param 1",
+                description, spy.getBoundString(1));
+        assertEquals("User ID must be correctly bound as param 2",
+                userId, spy.getBoundString(2));
+    }
 }

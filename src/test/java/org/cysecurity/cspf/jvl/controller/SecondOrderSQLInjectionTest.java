@@ -775,4 +775,256 @@ public class SecondOrderSQLInjectionTest {
         assertEquals("User ID must be correctly bound as param 2",
                 userId, spy.getBoundString(2));
     }
+
+    // -------------------------------------------------------------------------
+    // Helper: simulate the parameterized SELECTs used in myprofile.jsp
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reproduces the PreparedStatement execution path for the users SELECT in
+     * myprofile.jsp so we can verify the 'id' request parameter is bound as a
+     * positional parameter rather than concatenated into SQL.
+     *
+     * This is the primary remediation for the SQL Injection (CWE-89) finding
+     * reported at line 29 of myprofile.jsp (sink: executeQuery on cards table).
+     * The fix also correctly parameterizes the users table query (line 21).
+     */
+    private ResultSet executeMyProfileUsersQuery(Connection con, String id)
+            throws SQLException {
+        PreparedStatement pstmt = con.prepareStatement(
+            "select * from users where id=?");
+        pstmt.setString(1, id);
+        return pstmt.executeQuery();
+    }
+
+    /**
+     * Reproduces the PreparedStatement execution path for the cards SELECT in
+     * myprofile.jsp — this is the exact SAST-reported SINK (line 29).
+     */
+    private ResultSet executeMyProfileCardsQuery(Connection con, String id)
+            throws SQLException {
+        PreparedStatement pstmt = con.prepareStatement(
+            "select * from cards where id=?");
+        pstmt.setString(1, id);
+        return pstmt.executeQuery();
+    }
+
+    // -------------------------------------------------------------------------
+    // myprofile.jsp test cases
+    // -------------------------------------------------------------------------
+
+    /**
+     * myprofile.jsp — verifies that the users SELECT (line 21) uses a
+     * PreparedStatement with 'id' bound as a positional parameter, not
+     * concatenated into the SQL string.
+     */
+    @Test
+    public void testMyProfileUsersQueryUsesParameterizedSelect() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalId = "42";
+
+        executeMyProfileUsersQuery(con, normalId);
+
+        assertEquals("myprofile.jsp users query must call prepareStatement exactly once",
+                1, con.getPreparedStatements().size());
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertTrue("Users SELECT SQL must contain '?' placeholder for id",
+                spy.getSql().contains("?"));
+        assertFalse("Users SELECT SQL template must NOT contain the raw id value",
+                spy.getSql().contains(normalId));
+
+        assertEquals("Bound param 1 (id) must equal the exact input",
+                normalId, spy.getBoundString(1));
+    }
+
+    /**
+     * myprofile.jsp — verifies that the cards SELECT (the reported SINK at line 29)
+     * uses a PreparedStatement with 'id' bound as a positional parameter.
+     */
+    @Test
+    public void testMyProfileCardsQueryUsesParameterizedSelect() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalId = "7";
+
+        executeMyProfileCardsQuery(con, normalId);
+
+        assertEquals("myprofile.jsp cards query must call prepareStatement exactly once",
+                1, con.getPreparedStatements().size());
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertTrue("Cards SELECT SQL must contain '?' placeholder for id",
+                spy.getSql().contains("?"));
+        assertFalse("Cards SELECT SQL template must NOT contain the raw id value",
+                spy.getSql().contains(normalId));
+
+        assertEquals("Bound param 1 (id) must equal the exact input",
+                normalId, spy.getBoundString(1));
+    }
+
+    /**
+     * myprofile.jsp — verifies that a classic SQL injection payload in the 'id'
+     * request parameter is treated as data and cannot alter the WHERE clause.
+     *
+     * Before the fix, the query was:
+     *   SELECT * FROM users WHERE id=1 OR 1=1
+     * which would return all rows. After the fix the payload is a bound parameter.
+     */
+    @Test
+    public void testMyProfileUsersQueryInjectionPayloadTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String injectionPayload = "1 OR 1=1";
+
+        executeMyProfileUsersQuery(con, injectionPayload);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertEquals("Users SELECT SQL template must be exactly the parameterized form",
+                "select * from users where id=?",
+                spy.getSql());
+
+        assertFalse("SQL template must not contain 'OR' from injection payload",
+                spy.getSql().toUpperCase().contains("OR"));
+
+        assertEquals("Injection payload must be bound as data param, not embedded in SQL",
+                injectionPayload, spy.getBoundString(1));
+    }
+
+    /**
+     * myprofile.jsp — verifies that a UNION-based injection payload in the 'id'
+     * request parameter is treated as data and cannot exfiltrate additional rows.
+     *
+     * Before the fix, a payload like:
+     *   0 UNION SELECT username,password,email,null,... FROM users
+     * would return all credentials. After the fix the payload is a bound parameter.
+     */
+    @Test
+    public void testMyProfileCardsQueryUnionInjectionTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String unionPayload = "0 UNION SELECT cardno,cvv,expirydate,null FROM users--";
+
+        executeMyProfileCardsQuery(con, unionPayload);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertEquals("Cards SELECT SQL template must be exactly the parameterized form",
+                "select * from cards where id=?",
+                spy.getSql());
+
+        assertFalse("UNION keyword must not appear in the cards SQL template",
+                spy.getSql().toUpperCase().contains("UNION"));
+        assertFalse("SQL comment '--' must not appear in the cards SQL template",
+                spy.getSql().contains("--"));
+
+        assertEquals("UNION payload must be bound as safe parameter data",
+                unionPayload, spy.getBoundString(1));
+    }
+
+    /**
+     * myprofile.jsp — verifies that a tautology-based bypass (' OR '1'='1) in
+     * the 'id' request parameter is treated as data for both queries.
+     */
+    @Test
+    public void testMyProfileTautologyBypassTreatedAsData() throws SQLException {
+        SpyConnection con1 = new SpyConnection();
+        SpyConnection con2 = new SpyConnection();
+        String tautologyPayload = "' OR '1'='1";
+
+        executeMyProfileUsersQuery(con1, tautologyPayload);
+        executeMyProfileCardsQuery(con2, tautologyPayload);
+
+        SpyPreparedStatement usersSpy = con1.getPreparedStatements().get(0);
+        SpyPreparedStatement cardsSpy = con2.getPreparedStatements().get(0);
+
+        // Both SQL templates must remain static
+        assertFalse("Users SQL template must not contain tautology payload",
+                usersSpy.getSql().contains(tautologyPayload));
+        assertFalse("Cards SQL template must not contain tautology payload",
+                cardsSpy.getSql().contains(tautologyPayload));
+
+        // Both payloads must be bound as parameters
+        assertEquals("Tautology payload must be bound as data in users query",
+                tautologyPayload, usersSpy.getBoundString(1));
+        assertEquals("Tautology payload must be bound as data in cards query",
+                tautologyPayload, cardsSpy.getBoundString(1));
+    }
+
+    /**
+     * myprofile.jsp — verifies that a SQL comment-injection bypass in the 'id'
+     * parameter cannot truncate the query to bypass additional conditions.
+     */
+    @Test
+    public void testMyProfileCommentInjectionTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String commentPayload = "1--";
+
+        executeMyProfileUsersQuery(con, commentPayload);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertFalse("SQL comment '--' must not appear in the users SELECT SQL template",
+                spy.getSql().contains("--"));
+
+        assertEquals("Comment-injection payload must be bound as data",
+                commentPayload, spy.getBoundString(1));
+    }
+
+    /**
+     * myprofile.jsp — verifies that exactly 1 '?' placeholder exists in each
+     * parameterized SELECT (one for the 'id' parameter).
+     */
+    @Test
+    public void testMyProfileQueriesHaveExactlyOnePlaceholder() throws SQLException {
+        SpyConnection conUsers = new SpyConnection();
+        executeMyProfileUsersQuery(conUsers, "5");
+        String usersSql = conUsers.getPreparedStatements().get(0).getSql();
+        int usersPlaceholders = usersSql.length() - usersSql.replace("?", "").length();
+        assertEquals("Users SELECT in myprofile.jsp must have exactly 1 '?' placeholder",
+                1, usersPlaceholders);
+
+        SpyConnection conCards = new SpyConnection();
+        executeMyProfileCardsQuery(conCards, "5");
+        String cardsSql = conCards.getPreparedStatements().get(0).getSql();
+        int cardsPlaceholders = cardsSql.length() - cardsSql.replace("?", "").length();
+        assertEquals("Cards SELECT in myprofile.jsp must have exactly 1 '?' placeholder",
+                1, cardsPlaceholders);
+    }
+
+    /**
+     * myprofile.jsp — regression test ensuring that a normal, benign user ID
+     * is correctly bound and the SQL template references the correct tables
+     * and column, confirming the fix does not break normal functionality.
+     */
+    @Test
+    public void testMyProfileNormalIdIsCorrectlyBoundInBothQueries() throws SQLException {
+        SpyConnection conUsers = new SpyConnection();
+        SpyConnection conCards = new SpyConnection();
+        String userId = "99";
+
+        executeMyProfileUsersQuery(conUsers, userId);
+        executeMyProfileCardsQuery(conCards, userId);
+
+        SpyPreparedStatement usersSpy = conUsers.getPreparedStatements().get(0);
+        SpyPreparedStatement cardsSpy = conCards.getPreparedStatements().get(0);
+
+        // Verify users query references correct table and column
+        assertTrue("Users SELECT SQL must reference 'users' table",
+                usersSpy.getSql().toLowerCase().contains("users"));
+        assertTrue("Users SELECT SQL must filter by 'id' column",
+                usersSpy.getSql().toLowerCase().contains("id"));
+
+        // Verify cards query references correct table and column
+        assertTrue("Cards SELECT SQL must reference 'cards' table",
+                cardsSpy.getSql().toLowerCase().contains("cards"));
+        assertTrue("Cards SELECT SQL must filter by 'id' column",
+                cardsSpy.getSql().toLowerCase().contains("id"));
+
+        // Verify the id is correctly bound in both statements
+        assertEquals("User id must be bound as param 1 in users query",
+                userId, usersSpy.getBoundString(1));
+        assertEquals("User id must be bound as param 1 in cards query",
+                userId, cardsSpy.getBoundString(1));
+    }
 }

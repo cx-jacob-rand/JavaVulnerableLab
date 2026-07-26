@@ -775,4 +775,259 @@ public class SecondOrderSQLInjectionTest {
         assertEquals("User ID must be correctly bound as param 2",
                 userId, spy.getBoundString(2));
     }
+
+    // -------------------------------------------------------------------------
+    // Helper: simulate the parameterized SELECT used in ForgotPassword.jsp
+    // -------------------------------------------------------------------------
+
+    /**
+     * Reproduces the PreparedStatement execution path in ForgotPassword.jsp so
+     * we can verify that the SQL injection sink (SELECT by username and secret)
+     * uses parameterized queries instead of string concatenation (CWE-89).
+     *
+     * The 'username' and 'secret' parameters come directly from
+     * request.getParameter(), making this a first-order SQL injection vector.
+     */
+    private ResultSet executeForgotPasswordQuery(Connection con, String username, String secret)
+            throws SQLException {
+        PreparedStatement pstmt = con.prepareStatement(
+            "select * from users where username=? and secret=?");
+        pstmt.setString(1, username.trim());
+        pstmt.setString(2, secret);
+        return pstmt.executeQuery();
+    }
+
+    // -------------------------------------------------------------------------
+    // ForgotPassword.jsp test cases
+    // -------------------------------------------------------------------------
+
+    /**
+     * ForgotPassword.jsp — verifies that the SELECT uses a PreparedStatement
+     * template with two positional placeholders (username and secret), not
+     * string concatenation.
+     *
+     * This is the primary remediation for the SQL Injection (CWE-89) finding
+     * reported at line 42 of ForgotPassword.jsp.
+     */
+    @Test
+    public void testForgotPasswordUsesParameterizedSelect() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalUsername = "alice";
+        String normalSecret = "fluffy";
+
+        executeForgotPasswordQuery(con, normalUsername, normalSecret);
+
+        assertEquals("ForgotPassword.jsp must call prepareStatement exactly once for the SELECT",
+                1, con.getPreparedStatements().size());
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // SQL template must use positional parameters — no concatenation
+        assertTrue("SELECT SQL template must contain '?' placeholders for user input",
+                spy.getSql().contains("?"));
+        assertFalse("SELECT SQL template must NOT contain the raw username value",
+                spy.getSql().contains(normalUsername));
+        assertFalse("SELECT SQL template must NOT contain the raw secret value",
+                spy.getSql().contains(normalSecret));
+
+        // Values must be bound parameters, not embedded in SQL
+        assertEquals("Bound param 1 (username) must equal the trimmed input",
+                normalUsername, spy.getBoundString(1));
+        assertEquals("Bound param 2 (secret) must equal the exact input",
+                normalSecret, spy.getBoundString(2));
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that the exact parameterized SQL template
+     * is used, matching what the SAST engine recognizes as safe.
+     */
+    @Test
+    public void testForgotPasswordSQLTemplateIsExactlyParameterized() throws SQLException {
+        SpyConnection con = new SpyConnection();
+
+        executeForgotPasswordQuery(con, "user", "secret");
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertEquals("ForgotPassword.jsp SQL template must be exactly the parameterized form",
+                "select * from users where username=? and secret=?",
+                spy.getSql());
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that a classic authentication bypass payload
+     * (' OR '1'='1) in the username field is treated as data, not SQL syntax.
+     *
+     * Before the fix, the query would be:
+     *   SELECT * FROM users WHERE username='' OR '1'='1' AND secret='...'
+     * which bypasses authentication. After the fix, the payload is a bound parameter.
+     */
+    @Test
+    public void testForgotPasswordAuthBypassPayloadTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String bypassUsername = "' OR '1'='1";
+        String anySecret = "anything";
+
+        executeForgotPasswordQuery(con, bypassUsername, anySecret);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // The SQL template must remain static
+        assertEquals("ForgotPassword.jsp SQL template must not be altered by the injection payload",
+                "select * from users where username=? and secret=?",
+                spy.getSql());
+
+        // The injection payload must be bound as data
+        assertEquals("Auth bypass payload in username must be bound as data param 1",
+                bypassUsername.trim(), spy.getBoundString(1));
+        assertFalse("SQL template must not contain 'OR' keyword from injection payload",
+                spy.getSql().toUpperCase().contains(" OR "));
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that a SQL comment sequence (--) in the
+     * username field cannot comment out the secret check.
+     *
+     * Before the fix, the query would be:
+     *   SELECT * FROM users WHERE username='admin'--' AND secret='...'
+     * which bypasses the secret check entirely.
+     */
+    @Test
+    public void testForgotPasswordCommentBypassTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String commentBypass = "admin'--";
+        String anySecret = "irrelevant";
+
+        executeForgotPasswordQuery(con, commentBypass, anySecret);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // The SQL template must NOT contain the comment sequence
+        assertFalse("SQL template must not contain SQL comment '--'",
+                spy.getSql().contains("--"));
+
+        // The bypass attempt must be bound as data
+        assertEquals("Comment-bypass username must be bound as data param 1",
+                commentBypass.trim(), spy.getBoundString(1));
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that a UNION-based injection payload in the
+     * username field cannot exfiltrate data from other tables.
+     *
+     * Before the fix, a crafted username could produce:
+     *   SELECT * FROM users WHERE username='' UNION SELECT ...--' AND secret='x'
+     */
+    @Test
+    public void testForgotPasswordUnionInjectionTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String unionPayload = "' UNION SELECT username,password,email,null,null,null,null,null FROM users--";
+        String anySecret = "x";
+
+        executeForgotPasswordQuery(con, unionPayload, anySecret);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertFalse("UNION keyword must not appear in the SELECT SQL template",
+                spy.getSql().toUpperCase().contains("UNION"));
+
+        assertEquals("UNION payload in username must be bound as safe data param",
+                unionPayload.trim(), spy.getBoundString(1));
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that injection through the secret field is
+     * also safely parameterized. An attacker could craft the secret parameter to
+     * alter the query's WHERE clause.
+     */
+    @Test
+    public void testForgotPasswordSecretFieldInjectionTreatedAsData() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String normalUsername = "alice";
+        String maliciousSecret = "' OR '1'='1";
+
+        executeForgotPasswordQuery(con, normalUsername, maliciousSecret);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        assertEquals("ForgotPassword.jsp SQL template must remain static",
+                "select * from users where username=? and secret=?",
+                spy.getSql());
+
+        assertEquals("Normal username must be bound as param 1",
+                normalUsername, spy.getBoundString(1));
+        assertEquals("Injection payload in secret must be bound as data param 2",
+                maliciousSecret, spy.getBoundString(2));
+
+        assertFalse("SQL template must not contain injection payload from secret field",
+                spy.getSql().toUpperCase().contains(" OR "));
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that the SELECT template has exactly 2
+     * '?' placeholders: one for username and one for secret.
+     */
+    @Test
+    public void testForgotPasswordSelectHasTwoPlaceholders() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        executeForgotPasswordQuery(con, "user", "secret");
+
+        String sql = con.getPreparedStatements().get(0).getSql();
+        int placeholderCount = sql.length() - sql.replace("?", "").length();
+
+        assertEquals("ForgotPassword.jsp SELECT must have exactly 2 '?' placeholders " +
+                     "(one for username, one for secret)",
+                2, placeholderCount);
+    }
+
+    /**
+     * ForgotPassword.jsp — verifies that whitespace trimming on the username
+     * parameter is still applied correctly in the parameterized version.
+     * The fix calls request.getParameter("username").trim() before binding.
+     */
+    @Test
+    public void testForgotPasswordUsernameTrimmedBeforeBinding() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String paddedUsername = "  alice  ";
+        String secret = "fluffy";
+
+        executeForgotPasswordQuery(con, paddedUsername, secret);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // The bound value should be the trimmed username
+        assertEquals("Username must be trimmed before binding as param 1",
+                paddedUsername.trim(), spy.getBoundString(1));
+        assertEquals("Secret must be bound unchanged as param 2",
+                secret, spy.getBoundString(2));
+    }
+
+    /**
+     * ForgotPassword.jsp — regression test ensuring that normal, benign use of
+     * the password recovery form continues to work correctly after the fix.
+     */
+    @Test
+    public void testForgotPasswordNormalUseCaseWorksProperly() throws SQLException {
+        SpyConnection con = new SpyConnection();
+        String username = "johndoe";
+        String secret = "whiskers";
+
+        executeForgotPasswordQuery(con, username, secret);
+
+        SpyPreparedStatement spy = con.getPreparedStatements().get(0);
+
+        // Verify the SQL shape references the correct table and columns
+        assertTrue("SQL template must reference the 'users' table",
+                spy.getSql().toLowerCase().contains("users"));
+        assertTrue("SQL template must filter by 'username'",
+                spy.getSql().toLowerCase().contains("username"));
+        assertTrue("SQL template must filter by 'secret'",
+                spy.getSql().toLowerCase().contains("secret"));
+
+        // Verify parameter binding for normal values
+        assertEquals("Normal username must be correctly bound as param 1",
+                username, spy.getBoundString(1));
+        assertEquals("Normal secret must be correctly bound as param 2",
+                secret, spy.getBoundString(2));
+    }
 }

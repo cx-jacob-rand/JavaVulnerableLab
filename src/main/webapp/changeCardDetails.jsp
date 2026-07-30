@@ -1,6 +1,6 @@
  <%@ include file="/header.jsp" %>
  <%@page import="java.sql.Connection"%>
-<%@page import="java.sql.Statement"%>
+<%@page import="java.sql.PreparedStatement"%>
 <%@page import="java.sql.SQLException"%>
 
 <%@page import="java.sql.ResultSetMetaData"%>
@@ -39,9 +39,15 @@ if(session.getAttribute("isLoggedIn")!=null)
         String expirydate=request.getParameter("expirydate");
         if(!cardno.equals("") && !cvv.equals("") && !expirydate.equals(""))
         {
-         Statement stmt = con.createStatement();
-         stmt.executeUpdate("INSERT into cards(id,cardno, cvv,expirydate) values ('"+id+"','"+cardno+"','"+cvv+"','"+expirydate+"')");
-         out.print("<b style='color:green'> * Card details added *</b>");   
+         // Use PreparedStatement to prevent SQL injection
+         PreparedStatement pstmt = con.prepareStatement(
+             "INSERT into cards(id,cardno,cvv,expirydate) values (?,?,?,?)");
+         pstmt.setString(1, id);
+         pstmt.setString(2, cardno);
+         pstmt.setString(3, cvv);
+         pstmt.setString(4, expirydate);
+         pstmt.executeUpdate();
+         out.print("<b style='color:green'> * Card details added *</b>");
         }
         else
         {

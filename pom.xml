@@ -34,12 +34,21 @@
 		<artifactId>hibernate-core</artifactId>
 		<version>4.0.1.Final</version>
 	</dependency>
+	<!-- CVE-2016-2170: Override transitive commons-collections 3.2.1 (pulled in by
+	     hibernate-core) with the patched version 3.2.2 to remediate the unsafe Java
+	     deserialization vulnerability (CWE-502) that allows remote code execution via
+	     crafted serialized Java objects. -->
+	<dependency>
+		<groupId>commons-collections</groupId>
+		<artifactId>commons-collections</artifactId>
+		<version>3.2.2</version>
+	</dependency>
 	<dependency>
     <groupId>javax.servlet</groupId>
     <artifactId>servlet-api</artifactId>
     <version>2.3</version>
     <scope>provided</scope>
-</dependency>	 	
+</dependency>
   </dependencies>
   <build>
     <finalName>JavaVulnerableLab</finalName>

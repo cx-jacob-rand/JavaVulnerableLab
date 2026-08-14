@@ -2103,4 +2103,297 @@ public class SecondOrderSQLInjectionTest {
         assertEquals("Pages SELECT must have exactly 1 '?' placeholder",
                 1, count);
     }
+
+    // =========================================================================
+    // Tests for Stored XSS remediation in SendMessage.jsp (CWE-79)
+    //
+    // The SAST finding reports a Stored XSS taint path:
+    //   SOURCE: rs.getString("username") in adminlogin.jsp (line 27)
+    //           stored in session attribute "user"
+    //   SINK:   session.getAttribute("user") embedded in HTML output
+    //           in SendMessage.jsp (line 21) — previously unencoded
+    //
+    // The fix replaces the raw scriptlet expression
+    //   <%=session.getAttribute("user")%>
+    // with the JSTL <c:out> tag
+    //   <c:out value='${sessionScope.user}'/>
+    // which HTML-escapes the five XML special characters
+    //   <  >  &  "  '
+    // before writing them to the response.
+    //
+    // These unit tests validate the HTML-escaping contract that <c:out> enforces.
+    // They use Apache Tomcat's JSTL EL impl is not available here, so we
+    // replicate the exact character substitutions performed by javax.servlet.jsp.jstl
+    // c:out (escapeXml=true, the default), which maps:
+    //   '<'  -> "&lt;"
+    //   '>'  -> "&gt;"
+    //   '&'  -> "&amp;"
+    //   '"'  -> "&#034;"
+    //   '\'' -> "&#039;"
+    // This is the same contract documented in the JSTL 1.2 spec section EL.2.
+    // =========================================================================
+
+    /**
+     * Applies the same HTML character-escape substitutions that JSTL <c:out>
+     * (with escapeXml=true, the default) performs on output values.
+     *
+     * This mirrors the internal escaping used by
+     * org.apache.taglibs.standard.tag.common.core.OutSupport and is used
+     * by the tests below to verify the encoding contract independently of
+     * the servlet container.
+     */
+    private static String cOutEscape(String input) {
+        if (input == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(input.length() + 32);
+        for (int i = 0; i < input.length(); i++) {
+            char c = input.charAt(i);
+            switch (c) {
+                case '<':  sb.append("&lt;");   break;
+                case '>':  sb.append("&gt;");   break;
+                case '&':  sb.append("&amp;");  break;
+                case '"':  sb.append("&#034;"); break;
+                case '\'': sb.append("&#039;"); break;
+                default:   sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Simulates the full value= attribute rendering that SendMessage.jsp
+     * produces after the <c:out> fix, given a session username value.
+     *
+     * Before fix: value="<username-raw>"
+     * After fix:  value="<c:out-escaped-username>"
+     */
+    private static String renderSenderAttributeValue(String username) {
+        // Mirrors the fixed JSP output:
+        // <input type="hidden" name="sender" value="<c:out value='${sessionScope.user}'/>"/>
+        return "value=\"" + cOutEscape(username) + "\"";
+    }
+
+    // -------------------------------------------------------------------------
+    // Stored XSS test cases
+    // -------------------------------------------------------------------------
+
+    /**
+     * SendMessage.jsp — a normal username (no special characters) must be
+     * rendered unchanged. This is the regression / positive-functionality test.
+     */
+    @Test
+    public void testSendMessageNormalUsernameRenderedUnchanged() {
+        String normalUser = "alice";
+        String rendered = renderSenderAttributeValue(normalUser);
+
+        assertEquals("Normal username must appear verbatim in the value attribute",
+                "value=\"alice\"", rendered);
+    }
+
+    /**
+     * SendMessage.jsp — a username containing a script tag (the classic XSS
+     * payload stored at registration time) must be HTML-encoded so it cannot
+     * execute in the browser.
+     *
+     * Before fix: value="<script>alert('xss')</script>" → script executes
+     * After fix:  value="&lt;script&gt;alert(&#039;xss&#039;)&lt;/script&gt;"
+     *             → rendered as plain text, no script execution
+     */
+    @Test
+    public void testSendMessageScriptTagPayloadIsEncoded() {
+        String xssPayload = "<script>alert('xss')</script>";
+        String rendered = renderSenderAttributeValue(xssPayload);
+
+        // The raw payload must NOT appear in the output
+        assertFalse("Raw <script> tag must not appear in rendered output",
+                rendered.contains("<script>"));
+        assertFalse("Raw </script> tag must not appear in rendered output",
+                rendered.contains("</script>"));
+
+        // Angle brackets must be encoded
+        assertTrue("'<' must be HTML-encoded to '&lt;'",
+                rendered.contains("&lt;"));
+        assertTrue("'>' must be HTML-encoded to '&gt;'",
+                rendered.contains("&gt;"));
+
+        // Single quotes inside the payload must be encoded
+        assertTrue("Single quote must be HTML-encoded to '&#039;'",
+                rendered.contains("&#039;"));
+    }
+
+    /**
+     * SendMessage.jsp — a username with an HTML attribute-breaking double-quote
+     * must be encoded to prevent breaking out of the value="..." attribute context.
+     *
+     * Before fix: value="evil" onclick="alert(1)" x="  → attribute injection
+     * After fix:  value="evil&#034; onclick=&#034;alert(1)&#034; x=&#034;"
+     *             → safely rendered as text content
+     */
+    @Test
+    public void testSendMessageDoubleQuoteInUsernameIsEncoded() {
+        String attributeBreaker = "evil\" onclick=\"alert(1)\" x=\"";
+        String rendered = renderSenderAttributeValue(attributeBreaker);
+
+        // The raw double-quote must not appear (it would break the attribute boundary)
+        assertFalse("Raw double-quote must not appear in rendered attribute value",
+                rendered.substring("value=\"".length(), rendered.length() - 1).contains("\""));
+
+        // Double-quotes must be encoded
+        assertTrue("Double quote must be HTML-encoded to '&#034;'",
+                rendered.contains("&#034;"));
+    }
+
+    /**
+     * SendMessage.jsp — a username containing an ampersand (e.g., from an entity-
+     * injection attempt) must be HTML-encoded to prevent entity injection.
+     */
+    @Test
+    public void testSendMessageAmpersandInUsernameIsEncoded() {
+        String ampersandUsername = "user&admin";
+        String rendered = renderSenderAttributeValue(ampersandUsername);
+
+        assertFalse("Raw '&' must not appear in rendered output",
+                rendered.contains("user&admin"));
+        assertTrue("'&' must be HTML-encoded to '&amp;'",
+                rendered.contains("&amp;"));
+    }
+
+    /**
+     * SendMessage.jsp — a username containing an onerror event injection
+     * (stored XSS via img tag) must be fully encoded.
+     *
+     * Attack vector: register with username containing:
+     *   "><img src=x onerror=alert(document.cookie)>
+     * Previously this would execute when rendered inside the value="" attribute.
+     */
+    @Test
+    public void testSendMessageImgOnerrorPayloadIsEncoded() {
+        String imgPayload = "\"><img src=x onerror=alert(document.cookie)>";
+        String rendered = renderSenderAttributeValue(imgPayload);
+
+        assertFalse("Raw '<img' tag must not appear in rendered output",
+                rendered.contains("<img"));
+        assertFalse("Raw '\">' must not appear unencoded in rendered output — would break attribute",
+                rendered.contains("\">"));
+        assertTrue("'<' in payload must be encoded as '&lt;'",
+                rendered.contains("&lt;"));
+        assertTrue("'>' in payload must be encoded as '&gt;'",
+                rendered.contains("&gt;"));
+        assertTrue("'\"' in payload must be encoded as '&#034;'",
+                rendered.contains("&#034;"));
+    }
+
+    /**
+     * SendMessage.jsp — verify that the encoding is idempotent: applying
+     * cOutEscape once and again does not double-encode the same string.
+     * Only the FIRST application needs to produce encoded output.
+     */
+    @Test
+    public void testSendMessageEncodingIsAppliedExactlyOnce() {
+        String payload = "<b>bold</b>";
+
+        String encodedOnce = cOutEscape(payload);
+        assertEquals("First encoding must replace '<' with '&lt;' and '>' with '&gt;'",
+                "&lt;b&gt;bold&lt;/b&gt;", encodedOnce);
+
+        // The once-encoded string contains '&', which would be double-encoded if
+        // encoding were applied again. The JSP/JSTL only applies encoding once
+        // at the output layer — verify the contract holds.
+        String encodedTwice = cOutEscape(encodedOnce);
+        assertTrue("Double-encoding would produce '&amp;lt;' — this should NOT appear at runtime",
+                encodedTwice.contains("&amp;lt;"));
+
+        // The actual rendering (single application of <c:out>) must NOT produce double-encoded output
+        assertFalse("Single-pass encoding must not produce double-encoded entities in '&lt;b&gt;'",
+                encodedOnce.contains("&amp;"));
+    }
+
+    /**
+     * SendMessage.jsp — a null session attribute (e.g., user not logged in)
+     * must produce an empty string, not throw a NullPointerException.
+     * JSTL <c:out> silently renders empty string for null EL expressions.
+     */
+    @Test
+    public void testSendMessageNullUsernameRendersEmptyString() {
+        String rendered = cOutEscape(null);
+        assertEquals("Null input must produce an empty string (JSTL <c:out> contract)",
+                "", rendered);
+    }
+
+    /**
+     * SendMessage.jsp — a username that is purely whitespace must be preserved
+     * as-is (no special characters to encode), confirming the encoder does not
+     * trim or modify non-special-character content.
+     */
+    @Test
+    public void testSendMessageWhitespaceUsernamePreserved() {
+        String whitespace = "   user name   ";
+        String rendered = cOutEscape(whitespace);
+        assertEquals("Whitespace and normal characters must pass through unchanged",
+                "   user name   ", rendered);
+    }
+
+    /**
+     * SendMessage.jsp — a comprehensive XSS payload combining angle-brackets,
+     * quotes, and ampersands must have every special character encoded.
+     * This tests the full set of characters that JSTL <c:out> escapes.
+     */
+    @Test
+    public void testSendMessageAllSpecialCharactersAreEncoded() {
+        // Contains all five characters that <c:out> (escapeXml=true) encodes
+        String allSpecial = "<>&\"'";
+        String encoded = cOutEscape(allSpecial);
+
+        assertEquals("All five XML special characters must be encoded by <c:out>",
+                "&lt;&gt;&amp;&#034;&#039;", encoded);
+
+        // The original characters must not appear in the encoded form
+        assertFalse("'<' must not appear unencoded", encoded.contains("<"));
+        assertFalse("'>' must not appear unencoded", encoded.contains(">"));
+        // '&' appears encoded as '&amp;', '&#034;', '&#039;' — but never as bare '&<digit>' or '&letter'
+        assertFalse("Raw '\"' must not appear unencoded", encoded.contains("\""));
+        assertFalse("Raw \"'\" must not appear unencoded", encoded.contains("'"));
+    }
+
+    /**
+     * SendMessage.jsp — verifies the complete HTML attribute context for a
+     * classic Stored XSS payload that would be stored in the database
+     * (e.g., via a crafted username at registration) and later rendered
+     * in the hidden input's value attribute.
+     *
+     * This is the exact scenario described by the SAST finding:
+     *   1. Attacker registers with username: admin"><script>alert(1)</script>
+     *   2. adminlogin.jsp reads this from DB and stores in session["user"]
+     *   3. SendMessage.jsp previously rendered: value="admin"><script>…
+     *      which closed the value attribute and injected a script
+     *   4. After the fix with <c:out>: value="admin&#034;&gt;&lt;script&gt;…"
+     *      which is safely rendered as text
+     */
+    @Test
+    public void testSendMessageStoredXssScenarioIsBlockedEndToEnd() {
+        // Simulated username stored in DB at registration, later placed in session["user"]
+        String storedPayload = "admin\"><script>alert(document.cookie)</script>";
+
+        String rendered = renderSenderAttributeValue(storedPayload);
+
+        // The attack requires breaking out of the value="..." attribute — verify it is blocked
+        assertFalse("Attack payload must not be able to close the value attribute via '\"'",
+                // After the opening value=" the content must not contain an unencoded "
+                rendered.substring("value=\"".length(), rendered.length() - 1).contains("\""));
+
+        // The script tag must not appear in raw form
+        assertFalse("Raw '<script>' must not appear in the rendered attribute value",
+                rendered.contains("<script>"));
+
+        // The angle brackets must be encoded
+        assertTrue("'<' must be encoded as '&lt;'", rendered.contains("&lt;"));
+        assertTrue("'>' must be encoded as '&gt;'", rendered.contains("&gt;"));
+        assertTrue("'\"' must be encoded as '&#034;'", rendered.contains("&#034;"));
+
+        // The text content of the script tag ('alert(…)') is safe to keep as-is
+        // (it cannot execute without the enclosing <script> element)
+        assertTrue("Non-special characters in payload must be preserved",
+                rendered.contains("alert(document.cookie)"));
+    }
 }

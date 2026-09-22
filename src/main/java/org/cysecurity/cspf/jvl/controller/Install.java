@@ -12,8 +12,9 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.SQLException;
-import java.sql.Statement; 
+import java.sql.Statement;
 import java.util.Properties;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServlet;
@@ -102,21 +103,30 @@ public class Install extends HttpServlet {
     }
      protected boolean setup(String i) throws IOException
     {
-        
-       if(i.equals("1"))   
+
+       if(i.equals("1"))
        {
- 
+
                     try
                    {
+                    // Validate dbname using an allowlist: only alphanumeric characters and underscores
+                    // are permitted as database identifiers to prevent SQL injection in DDL statements.
+                    if (dbname == null || !dbname.matches("[a-zA-Z0-9_]+")) {
+                        System.out.println("Invalid database name: contains disallowed characters.");
+                        return false;
+                    }
+
                     Class.forName(jdbcdriver);
                     Connection con= DriverManager.getConnection(dburl,dbuser,dbpass);
                       if(con!=null && !con.isClosed())
                         {
-                            //Database creation
-                             Statement stmt = con.createStatement();  
-                             stmt.executeUpdate("DROP DATABASE IF EXISTS "+dbname);
-                             
-                             stmt.executeUpdate("CREATE DATABASE "+dbname);
+                            // Database creation using backtick-quoted, allowlist-validated identifier.
+                            // PreparedStatement does not support ? placeholders for DDL identifiers,
+                            // so we use strict allowlist validation above and backtick quoting here.
+                             Statement stmt = con.createStatement();
+                             stmt.executeUpdate("DROP DATABASE IF EXISTS `" + dbname + "`");
+
+                             stmt.executeUpdate("CREATE DATABASE `" + dbname + "`");
                              con.close();
                             con= DriverManager.getConnection(dburl+dbname,dbuser,dbpass);
                              stmt = con.createStatement();
@@ -124,7 +134,13 @@ public class Install extends HttpServlet {
                             {
                                 //User Table creation
                                 stmt.executeUpdate("Create table users(ID int NOT NULL AUTO_INCREMENT, username varchar(30),email varchar(60), password varchar(60), about varchar(50),privilege varchar(20),avatar TEXT,secretquestion int,secret varchar(30),primary key (id))");
-                                  stmt.executeUpdate("INSERT into users(username, password, email,About,avatar, privilege,secretquestion,secret) values ('"+adminuser+"','"+adminpass+"','admin@localhost','I am the admin of this application','default.jpg','admin',1,'rocky')");
+                                  // Use PreparedStatement to bind adminuser and adminpass safely
+                                  PreparedStatement pstmt = con.prepareStatement(
+                                      "INSERT into users(username, password, email,About,avatar, privilege,secretquestion,secret) values (?,?,'admin@localhost','I am the admin of this application','default.jpg','admin',1,'rocky')");
+                                  pstmt.setString(1, adminuser);
+                                  pstmt.setString(2, adminpass);
+                                  pstmt.executeUpdate();
+                                  pstmt.close();
                                   stmt.executeUpdate("INSERT into users(username, password, email,About,avatar, privilege,secretquestion,secret) values ('victim','victim','victim@localhost','I am the victim of this application','default.jpg','user',1,'max')");
                                   stmt.executeUpdate("INSERT into users(username, password, email,About,avatar, privilege,secretquestion,secret) values ('attacker','attacker','attacker@localhost','I am the attacker of this application','default.jpg','user',1,'bella')");
                                 stmt.executeUpdate("INSERT into users(username, password, email,About,avatar, privilege,secretquestion,secret) values ('NEO','trinity','neo@matrix','I am the NEO','default.jpg','user',1,'sentinel')");

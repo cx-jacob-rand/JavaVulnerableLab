@@ -9,6 +9,7 @@ package org.cysecurity.cspf.jvl.controller;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -53,13 +54,24 @@ public class Register extends HttpServlet {
              {
                     if(con!=null && !con.isClosed())
                                {
-                                  
-                                   Statement stmt = con.createStatement();  
-                                  stmt.executeUpdate("INSERT into users(username, password, email, About,avatar,privilege,secretquestion,secret) values ('"+user+"','"+pass+"','"+email+"','"+about+"','default.jpg','user',1,'"+secret+"')");
-                                       stmt.executeUpdate("INSERT into UserMessages(recipient, sender, subject, msg) values ('"+user+"','admin','Hi','Hi<br/> This is admin of this page. <br/> Welcome to Our Forum')");
-             
+                                   // Use PreparedStatement to prevent SQL injection
+                                   PreparedStatement pstmt = con.prepareStatement(
+                                       "INSERT into users(username, password, email, About, avatar, privilege, secretquestion, secret) values (?,?,?,?,'default.jpg','user',1,?)");
+                                   pstmt.setString(1, user);
+                                   pstmt.setString(2, pass);
+                                   pstmt.setString(3, email);
+                                   pstmt.setString(4, about);
+                                   pstmt.setString(5, secret);
+                                   pstmt.executeUpdate();
+
+                                   // Welcome message also uses PreparedStatement
+                                   PreparedStatement pstmt2 = con.prepareStatement(
+                                       "INSERT into UserMessages(recipient, sender, subject, msg) values (?,'admin','Hi','Hi<br/> This is admin of this page. <br/> Welcome to Our Forum')");
+                                   pstmt2.setString(1, user);
+                                   pstmt2.executeUpdate();
+
                                     response.sendRedirect("index.jsp");
-                                    
+
                                }
                     else
                     {

@@ -1,6 +1,7 @@
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.util.Properties;
+import org.cysecurity.cspf.jvl.config.AppConfig;
 
 public class PaymentServiceClient {
 
@@ -30,6 +31,8 @@ public class PaymentServiceClient {
     public String getStripeKey() {
         return STRIPE_API_KEY;
     }
-}       return AppConfig.getWebhookSecret();
+
+    public String getWebhookSecret() {
+        return AppConfig.getWebhookSecret();
     }
 }

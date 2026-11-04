@@ -296,6 +296,56 @@ public class SecondOrderSqlInjectionTest extends TestCase {
     }
 
     // ---------------------------------------------------------------------------
+    // changeCardDetails.jsp – INSERT query fix (expirydate / cardno / cvv)
+    // ---------------------------------------------------------------------------
+
+    private static final String CARD_INSERT =
+            "INSERT into cards(id,cardno, cvv,expirydate) values (?,?,?,?)";
+
+    /**
+     * Verifies that the INSERT in changeCardDetails.jsp binds all request values
+     * (notably "expirydate") as parameters instead of concatenating them.
+     */
+    public void testChangeCardDetailsUsesParameterizedInsert() throws SQLException {
+        SqlCapturingConnection con = new SqlCapturingConnection();
+
+        PreparedStatementSpy stmt = con.prepareStatement(CARD_INSERT);
+        stmt.setString(1, "7");
+        stmt.setString(2, "4111111111111111");
+        stmt.setString(3, "123");
+        stmt.setString(4, "12/30");
+        stmt.executeUpdate();
+
+        String template = stmt.getSqlTemplate();
+        assertTrue("Template must use four placeholders", template.contains("values (?,?,?,?)"));
+        assertFalse("Template must not embed expiry date", template.contains("12/30"));
+        assertEquals("Four parameters must be bound", 4, stmt.getBoundParameters().size());
+        assertTrue("executeUpdate() must have been called", stmt.wasUpdateExecuted());
+        assertFalse("Unsafe createStatement() must NOT be used", con.wasCreateStatementCalled());
+    }
+
+    /**
+     * Verifies that an injection payload in "expirydate" is kept as bound data
+     * and never reaches the SQL template.
+     */
+    public void testChangeCardDetailsResistsInjectionInExpiryDate() throws SQLException {
+        SqlCapturingConnection con = new SqlCapturingConnection();
+        String payload = "x'); DROP TABLE cards; --";
+
+        PreparedStatementSpy stmt = con.prepareStatement(CARD_INSERT);
+        stmt.setString(1, "7");
+        stmt.setString(2, "4111111111111111");
+        stmt.setString(3, "123");
+        stmt.setString(4, payload);
+        stmt.executeUpdate();
+
+        assertFalse("Template must not contain the payload", stmt.getSqlTemplate().contains(payload));
+        assertFalse("Template must not contain DROP TABLE",
+                stmt.getSqlTemplate().toLowerCase().contains("drop table"));
+        assertEquals("Payload must be bound as the 4th parameter", payload, stmt.getBoundParameters().get(3));
+    }
+
+    // ---------------------------------------------------------------------------
     // End-to-end second-order flow
     // ---------------------------------------------------------------------------
 

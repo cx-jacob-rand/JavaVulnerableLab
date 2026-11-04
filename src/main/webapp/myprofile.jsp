@@ -1,5 +1,6 @@
  <%@ include file="/header.jsp" %>
  <%@page import="java.sql.Connection"%>
+<%@page import="java.sql.PreparedStatement"%>
 <%@page import="java.sql.Statement"%>
 <%@page import="java.sql.SQLException"%>
 
@@ -26,7 +27,9 @@ if(session.getAttribute("isLoggedIn")!=null)
                 out.print("About : "+rs.getString("about")+"<br>"); 
                  
                 //Getting Card Details:
-                ResultSet rs1=stmt.executeQuery("select * from cards where id="+id);
+                PreparedStatement cardStmt = con.prepareStatement("select * from cards where id=?");
+                cardStmt.setString(1, id);
+                ResultSet rs1=cardStmt.executeQuery();
                  if(rs1 != null && rs1.next())
                 {
                    out.print("<br/>-------------------<br/>Card Details:<br/>-------------------<br/>");

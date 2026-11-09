@@ -41,6 +41,23 @@ public class MyProfileSqlInjectionTest extends TestCase {
                 jsp.contains("stmt.executeQuery(\"select * from cards"));
     }
 
+    public void testUsersQueryUsesPlaceholder() {
+        assertTrue("users query must be a prepared statement with a placeholder",
+                jsp.contains("prepareStatement(\"select * from users where id=?\")"));
+        assertTrue("id must be bound via setString", jsp.contains("userStmt.setString(1, id)"));
+        assertTrue("prepared statement must be executed without SQL text",
+                jsp.contains("userStmt.executeQuery()"));
+    }
+
+    public void testUsersQueryIsNotConcatenated() {
+        assertFalse("users query must not concatenate the id parameter",
+                jsp.contains("from users where id=\"+id"));
+        assertFalse("users query must not be run through a plain Statement",
+                jsp.contains("stmt.executeQuery(\"select * from users"));
+        assertFalse("no plain Statement should be created for the id lookup",
+                jsp.contains("con.createStatement()"));
+    }
+
     public void testPreparedStatementIsImported() {
         assertTrue(jsp.contains("import=\"java.sql.PreparedStatement\""));
     }

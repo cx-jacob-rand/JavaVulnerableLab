@@ -17,9 +17,10 @@ if(session.getAttribute("isLoggedIn")!=null)
    String id=request.getParameter("id");
    if(id!=null && !id.equals(""))
    {
-        Statement stmt = con.createStatement();
+        PreparedStatement userStmt = con.prepareStatement("select * from users where id=?");
+             userStmt.setString(1, id);
              ResultSet rs =null;
-             rs=stmt.executeQuery("select * from users where id="+id);
+             rs=userStmt.executeQuery();
               if(rs != null && rs.next())
               {
                 out.print("UserName : "+rs.getString("username")+"<br>"); 
